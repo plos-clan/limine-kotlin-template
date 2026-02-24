@@ -1,6 +1,6 @@
 # Limine Kotlin Template
 
-This repository will demonstrate how to set up a basic x86-64 kernel in Kotlin/Native + C using Limine.
+This repository will demonstrate how to set up a basic x86-64 kernel in Kotlin using Limine.
 
 ## Notes
 
@@ -8,7 +8,6 @@ Initialize the `mlibc` submodule and build it once:
 
 ```bash
 git submodule update --init --recursive
-make mlibc
 ```
 
 Only UEFI is supported in this template.
@@ -28,7 +27,7 @@ Only UEFI is supported in this template.
 - `make distclean`: Remove the entire `build` directory
 - `make mlibc`: Build bundled `mlibc` into `build/mlibc-x86_64/prefix`
 
-You need to install `konanc`, `cinterop`, `clang`, `clang++`, `ld.lld`, `xorriso`, `make` to build the project, and `qemu-system-x86_64` to boot the ISO.
+You need to install Kotlin/Native (`konanc`, `cinterop`), Clang (`clang`, `clang++`), LLD (`ld.lld`), `xorriso`, and `make` to build the project, and QEMU (`qemu-system-x86_64`) to boot the ISO.
 
 ## License
 
