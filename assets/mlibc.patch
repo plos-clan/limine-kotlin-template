@@ -1,0 +1,1134 @@
+diff --git a/meson.build b/meson.build
+index df1f291b8..96170fe9a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -286,6 +286,12 @@ elif host_machine.system() == 'menix'
+ 	internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', true)
+ 	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
+ 	subdir('sysdeps/menix')
++elif host_machine.system() == 'template'
++	disable_linux_option = true
++	static_pic_enabled = false
++	rtld_include_dirs += include_directories('sysdeps/template/include')
++	libc_include_dirs += include_directories('sysdeps/template/include')
++	subdir('sysdeps/template')
+ # ANCHOR: demo-sysdeps
+ elif host_machine.system() == 'demo'
+ 	subdir('sysdeps/demo')
+diff --git a/options/rtld/generic/main.cpp b/options/rtld/generic/main.cpp
+index d4660cb59..d5dd9ec06 100644
+--- a/options/rtld/generic/main.cpp
++++ b/options/rtld/generic/main.cpp
+@@ -541,11 +541,6 @@ extern "C" void *interpreterMain(uintptr_t *entry_stack) {
+ #else
+ 	(void)env_ld_library_path;
+ 	(void)env_ld_preload;
+-	auto ehdr = reinterpret_cast<elf_ehdr*>(__ehdr_start);
+-	phdr_pointer = reinterpret_cast<void*>((uintptr_t)ehdr->e_phoff + (uintptr_t)ehdr);
+-	phdr_entry_size = ehdr->e_phentsize;
+-	phdr_count = ehdr->e_phnum;
+-	entry_pointer = reinterpret_cast<void*>(ehdr->e_entry);
+ #endif
+ 	__ensure(phdr_pointer);
+ 	__ensure(entry_pointer);
+diff --git a/sysdeps/template/generic/generic.cpp b/sysdeps/template/generic/generic.cpp
+new file mode 100644
+index 000000000..dcccc4ad6
+--- /dev/null
++++ b/sysdeps/template/generic/generic.cpp
+@@ -0,0 +1,601 @@
++#include <bits/ensure.h>
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <mlibc/all-sysdeps.hpp>
++#include <mlibc/debug.hpp>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#pragma GCC diagnostic ignored "-Wunused-parameter"
++
++#define STUB_ONLY                               \
++{                                               \
++	__ensure(!"STUB_ONLY function was called"); \
++	__builtin_unreachable();                    \
++}
++
++namespace mlibc {
++
++void sys_libc_log(const char *message) {}
++
++[[noreturn]] void sys_libc_panic() { __builtin_unreachable(); }
++
++[[noreturn]] void sys_exit(int status) { __builtin_unreachable(); };
++
++#ifndef MLIBC_BUILDING_RTLD
++
++[[noreturn]] void sys_thread_exit() { __builtin_unreachable(); };
++
++int sys_clone(void *tcb, pid_t *pid_out, void *stack)
++{
++	return 2;
++}
++
++int sys_prepare_stack(
++	void **stack,
++	void *entry,
++	void *arg,
++	void *tcb,
++	size_t *stack_size,
++	size_t *guard_size,
++	void **stack_base
++) {
++	if (!stack || !stack_size || !guard_size || !stack_base)
++		return EINVAL;
++
++	constexpr size_t default_stack_size = 0x200000;
++	constexpr size_t stack_items = 3;
++	constexpr size_t minimum_stack_size = stack_items * sizeof(uintptr_t);
++
++	if (!*stack_size)
++		*stack_size = default_stack_size;
++	if (*stack_size < minimum_stack_size)
++		*stack_size = minimum_stack_size;
++
++	*guard_size = 0;
++
++	if (!*stack) {
++		int e = sys_anon_allocate(*stack_size, stack_base);
++		if (e)
++			return e;
++	} else {
++		*stack_base = *stack;
++	}
++
++	uintptr_t base = reinterpret_cast<uintptr_t>(*stack_base);
++	if (base > UINTPTR_MAX - *stack_size)
++		return EINVAL;
++
++	uintptr_t top = base + *stack_size;
++	top &= ~(sizeof(uintptr_t) - 1);
++
++	auto sp = reinterpret_cast<uintptr_t *>(top);
++	*--sp = reinterpret_cast<uintptr_t>(tcb);
++	*--sp = reinterpret_cast<uintptr_t>(arg);
++	*--sp = reinterpret_cast<uintptr_t>(entry);
++
++	*stack = reinterpret_cast<void *>(sp);
++	return 0;
++}
++
++int sys_kill(pid_t pid, int signal) STUB_ONLY;
++
++int sys_tcgetattr(int fd, struct termios *attr) STUB_ONLY;
++
++int sys_tcsetattr(int fd, int optional_action, const struct termios *attr) STUB_ONLY;
++
++#endif
++
++#define IA32_FS_BASE 0xc0000100
++
++static inline void wrmsr(uint32_t msr, uint64_t value) {
++	uint32_t eax = (uint32_t)value;
++	uint32_t edx = value >> 32;
++	asm volatile("wrmsr" : : "c"(msr), "a"(eax), "d"(edx));
++}
++
++static inline void cpu_relax() {
++#if defined(__x86_64__) || defined(__i386__)
++	asm volatile("pause" : : : "memory");
++#elif defined(__aarch64__) || defined(__arm__)
++	asm volatile("yield" : : : "memory");
++#else
++	asm volatile("" : : : "memory");
++#endif
++}
++
++namespace {
++
++constexpr size_t anon_page_size = 0x1000;
++constexpr size_t anon_arena_size = 16 * 1024 * 1024;
++constexpr size_t vm_arena_size = 64 * 1024 * 1024;
++
++struct AnonBlock {
++	size_t size;
++	AnonBlock *next;
++};
++
++alignas(anon_page_size) static unsigned char anon_arena[anon_arena_size];
++alignas(anon_page_size) static unsigned char vm_arena[vm_arena_size];
++static size_t anon_bump = 0;
++static size_t vm_bump = 0;
++static AnonBlock *anon_free_list = nullptr;
++static int anon_lock = 0;
++static int vm_lock = 0;
++
++static inline size_t anon_align_up(size_t n) {
++	if (n > SIZE_MAX - (anon_page_size - 1))
++		return 0;
++	return (n + anon_page_size - 1) & ~(anon_page_size - 1);
++}
++
++static inline void anon_lock_acquire() {
++	while (__atomic_test_and_set(&anon_lock, __ATOMIC_ACQUIRE))
++		cpu_relax();
++}
++
++static inline void anon_lock_release() { __atomic_clear(&anon_lock, __ATOMIC_RELEASE); }
++
++static inline void vm_lock_acquire() {
++	while (__atomic_test_and_set(&vm_lock, __ATOMIC_ACQUIRE))
++		cpu_relax();
++}
++
++static inline void vm_lock_release() { __atomic_clear(&vm_lock, __ATOMIC_RELEASE); }
++
++} // namespace
++
++int sys_tcb_set(void *pointer) {
++#if defined(__x86_64__)
++	wrmsr(IA32_FS_BASE, (uint64_t)pointer);
++#endif
++
++	return 0;
++};
++
++#ifndef MLIBC_BUILDING_RTLD
++
++int sys_ppoll(
++    struct pollfd *fds,
++    int nfds,
++    const struct timespec *timeout,
++    const sigset_t *sigmask,
++    int *num_events
++) STUB_ONLY;
++
++int sys_poll(struct pollfd *fds, nfds_t count, int timeout, int *num_events) STUB_ONLY;
++
++int sys_pselect(
++    int nfds,
++    fd_set *read_set,
++    fd_set *write_set,
++    fd_set *except_set,
++    const struct timespec *timeout,
++    const sigset_t *sigmask,
++    int *num_events
++) STUB_ONLY;
++
++#endif
++
++int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
++	// Fake futex for early bring-up: spin until the futex word changes.
++	if (__atomic_load_n(pointer, __ATOMIC_ACQUIRE) != expected)
++		return EAGAIN;
++
++	unsigned long long spin_budget = 0;
++	if (time) {
++		if (time->tv_nsec < 0 || time->tv_nsec >= 1'000'000'000)
++			return EINVAL;
++		if (time->tv_sec == 0 && time->tv_nsec == 0)
++			return ETIMEDOUT;
++
++		unsigned long long timeout_ns = 0;
++		if ((unsigned long long)time->tv_sec > ULLONG_MAX / 1'000'000'000)
++			timeout_ns = ULLONG_MAX;
++		else
++			timeout_ns = (unsigned long long)time->tv_sec * 1'000'000'000;
++		if (timeout_ns != ULLONG_MAX) {
++			unsigned long long rem = ULLONG_MAX - timeout_ns;
++			if ((unsigned long long)time->tv_nsec > rem)
++				timeout_ns = ULLONG_MAX;
++			else
++				timeout_ns += (unsigned long long)time->tv_nsec;
++		}
++
++		constexpr unsigned long long ns_per_spin = 64;
++		spin_budget = timeout_ns / ns_per_spin;
++		if (spin_budget != ULLONG_MAX)
++			++spin_budget;
++	}
++
++	while (__atomic_load_n(pointer, __ATOMIC_ACQUIRE) == expected) {
++		cpu_relax();
++		if (time) {
++			if (!spin_budget)
++				return ETIMEDOUT;
++			--spin_budget;
++		}
++	}
++
++	return 0;
++}
++
++int sys_futex_wake(int *pointer, bool all) {
++	(void)pointer;
++	(void)all;
++	return 0;
++}
++
++#ifndef MLIBC_BUILDING_RTLD
++
++int sys_ioctl(int fd, unsigned long request, void *arg, int *result) STUB_ONLY;
++
++int sys_isatty(int fd) STUB_ONLY;
++
++int sys_getcwd(char *buffer, size_t size) STUB_ONLY;
++
++#endif
++
++int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) STUB_ONLY;
++
++int sys_open(const char *path, int flags, mode_t mode, int *fd) STUB_ONLY;
++
++#ifndef MLIBC_BUILDING_RTLD
++
++int sys_open_dir(const char *path, int *handle) STUB_ONLY;
++
++int sys_read_entries(int fd, void *buffer, size_t max_size, size_t *bytes_read) STUB_ONLY;
++
++#endif
++
++int sys_close(int fd) STUB_ONLY;
++
++int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) STUB_ONLY;
++
++int sys_read(int fd, void *buf, size_t count, ssize_t *bytes_read) STUB_ONLY;
++
++#ifndef MLIBC_BUILDING_RTLD
++
++int sys_write(int fd, const void *buf, size_t count, ssize_t *bytes_written) STUB_ONLY;
++
++int sys_readlink(const char *path, void *data, size_t max_size, ssize_t *length) STUB_ONLY;
++
++int sys_link(const char *old_path, const char *new_path) STUB_ONLY;
++
++int sys_linkat(
++    int olddirfd, const char *old_path, int newdirfd, const char *new_path, int flags
++) STUB_ONLY;
++
++int sys_unlinkat(int fd, const char *path, int flags) STUB_ONLY;
++
++int sys_fchmod(int fd, mode_t mode) STUB_ONLY;
++
++int sys_rmdir(const char *path) STUB_ONLY;
++
++#endif
++
++int sys_vm_map(void *hint, size_t size, int prot, int flags, int fd, off_t offset, void **window) {
++	if (!window)
++		return EINVAL;
++	if (!size)
++		return EINVAL;
++	if (size >= PTRDIFF_MAX)
++		return ENOMEM;
++	if (offset < 0 || (offset & (anon_page_size - 1)))
++		return EINVAL;
++
++	int map_type = flags & (MAP_SHARED | MAP_PRIVATE);
++	if (map_type != MAP_SHARED && map_type != MAP_PRIVATE)
++		return EINVAL;
++
++#ifdef MAP_FIXED_NOREPLACE
++	bool fixed_noreplace = flags & MAP_FIXED_NOREPLACE;
++#else
++	bool fixed_noreplace = false;
++#endif
++	bool fixed = (flags & MAP_FIXED) || fixed_noreplace;
++	bool anonymous = flags & MAP_ANONYMOUS;
++
++	if (!anonymous) {
++		if (fd < 0)
++			return EBADF;
++		return ENOSYS;
++	}
++
++	(void)prot;
++	(void)fd;
++
++	size = anon_align_up(size);
++	if (!size)
++		return ENOMEM;
++
++	void *result = nullptr;
++	uintptr_t arena_base = reinterpret_cast<uintptr_t>(vm_arena);
++
++	vm_lock_acquire();
++
++	if (fixed) {
++		uintptr_t address = reinterpret_cast<uintptr_t>(hint);
++		if (address & (anon_page_size - 1)) {
++			vm_lock_release();
++			return EINVAL;
++		}
++		if (address < arena_base) {
++			vm_lock_release();
++			return ENOMEM;
++		}
++
++		size_t arena_offset = address - arena_base;
++		if (arena_offset > vm_arena_size - size) {
++			vm_lock_release();
++			return ENOMEM;
++		}
++
++		if (fixed_noreplace && arena_offset < vm_bump) {
++			vm_lock_release();
++			return EEXIST;
++		}
++
++		size_t map_end = arena_offset + size;
++		if (map_end > vm_bump)
++			vm_bump = map_end;
++		result = reinterpret_cast<void *>(address);
++	} else {
++		if (vm_bump > vm_arena_size - size) {
++			vm_lock_release();
++			return ENOMEM;
++		}
++
++		result = vm_arena + vm_bump;
++		vm_bump += size;
++	}
++
++	vm_lock_release();
++
++	memset(result, 0, size);
++	*window = result;
++	return 0;
++}
++
++int sys_vm_unmap(void *pointer, size_t size) {
++	(void)pointer;
++	(void)size;
++	return 0;
++}
++
++#ifndef MLIBC_BUILDING_RTLD
++
++int sys_vm_protect(void *pointer, size_t size, int prot) STUB_ONLY;
++
++#endif
++
++int sys_anon_allocate(size_t size, void **pointer) {
++	if (!pointer)
++		return EINVAL;
++
++	size = anon_align_up(size);
++	if (!size)
++		return ENOMEM;
++
++	void *result = nullptr;
++
++	anon_lock_acquire();
++
++	AnonBlock *previous = nullptr;
++	AnonBlock *current = anon_free_list;
++	while (current) {
++		if (current->size >= size) {
++			if (current->size - size >= anon_page_size) {
++				auto next =
++				    reinterpret_cast<AnonBlock *>(reinterpret_cast<uintptr_t>(current) + size);
++				next->size = current->size - size;
++				next->next = current->next;
++				if (previous)
++					previous->next = next;
++				else
++					anon_free_list = next;
++			} else {
++				size = current->size;
++				if (previous)
++					previous->next = current->next;
++				else
++					anon_free_list = current->next;
++			}
++
++			result = current;
++			break;
++		}
++
++		previous = current;
++		current = current->next;
++	}
++
++	if (!result) {
++		if (anon_bump > anon_arena_size - size) {
++			anon_lock_release();
++			return ENOMEM;
++		}
++
++		result = anon_arena + anon_bump;
++		anon_bump += size;
++	}
++
++	anon_lock_release();
++
++	memset(result, 0, size);
++	*pointer = result;
++	return 0;
++}
++
++int sys_anon_free(void *pointer, size_t size) {
++	if (!pointer)
++		return 0;
++
++	size = anon_align_up(size);
++	if (!size)
++		return EINVAL;
++
++	uintptr_t start = reinterpret_cast<uintptr_t>(anon_arena);
++	uintptr_t end = start + anon_arena_size;
++	uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
++	if (address < start || address + size > end)
++		return EINVAL;
++
++	if (address & (anon_page_size - 1))
++		return EINVAL;
++
++	auto block = reinterpret_cast<AnonBlock *>(pointer);
++	block->size = size;
++	block->next = nullptr;
++
++	anon_lock_acquire();
++
++	AnonBlock *previous = nullptr;
++	AnonBlock *current = anon_free_list;
++	while (current && current < block) {
++		previous = current;
++		current = current->next;
++	}
++
++	block->next = current;
++	if (previous)
++		previous->next = block;
++	else
++		anon_free_list = block;
++
++	if (block->next
++	    && reinterpret_cast<uintptr_t>(block) + block->size
++	           == reinterpret_cast<uintptr_t>(block->next)) {
++		block->size += block->next->size;
++		block->next = block->next->next;
++	}
++
++	if (previous
++	    && reinterpret_cast<uintptr_t>(previous) + previous->size
++	           == reinterpret_cast<uintptr_t>(block)) {
++		previous->size += block->size;
++		previous->next = block->next;
++	}
++
++	anon_lock_release();
++	return 0;
++}
++
++#ifndef MLIBC_BUILDING_RTLD
++
++pid_t sys_getpid() STUB_ONLY;
++
++pid_t sys_getppid() STUB_ONLY;
++
++uid_t sys_getuid() STUB_ONLY;
++
++uid_t sys_geteuid() STUB_ONLY;
++
++gid_t sys_getgid() STUB_ONLY;
++
++int sys_setgid(gid_t gid) STUB_ONLY;
++
++pid_t sys_getpgid(pid_t pid, pid_t *pgid) STUB_ONLY;
++
++gid_t sys_getegid() STUB_ONLY;
++
++int sys_setpgid(pid_t pid, pid_t pgid) STUB_ONLY;
++
++int sys_ttyname(int fd, char *buf, size_t size) STUB_ONLY;
++
++int sys_clock_get(int clock, time_t *secs, long *nanos) {
++	*secs = 0;
++	*nanos = 0;
++	return 0;
++};
++
++int
++sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) STUB_ONLY;
++
++int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) STUB_ONLY;
++
++int sys_access(const char *path, int mode) STUB_ONLY;
++
++int sys_pipe(int *fds, int flags) STUB_ONLY;
++
++int sys_chdir(const char *path) STUB_ONLY;
++
++int sys_mkdir(const char *path, mode_t mode) STUB_ONLY;
++
++int sys_mkdirat(int dirfd, const char *path, mode_t mode) STUB_ONLY;
++
++int sys_socket(int domain, int type_and_flags, int proto, int *fd) STUB_ONLY;
++
++int sys_socketpair(int domain, int type_and_flags, int proto, int *fds) STUB_ONLY;
++
++int sys_bind(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) STUB_ONLY;
++
++int sys_connect(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) STUB_ONLY;
++
++int sys_accept(
++    int fd, int *newfd, struct sockaddr *addr_ptr, socklen_t *addr_length, int flags
++) STUB_ONLY;
++
++int sys_getsockopt(
++    int fd, int layer, int number, void *__restrict buffer, socklen_t *__restrict size
++) STUB_ONLY;
++
++int sys_setsockopt(int fd, int layer, int number, const void *buffer, socklen_t size) STUB_ONLY;
++
++int sys_msg_recv(int sockfd, struct msghdr *hdr, int flags, ssize_t *length) STUB_ONLY;
++
++int sys_peername(
++    int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length, socklen_t *actual_length
++) STUB_ONLY;
++
++int sys_listen(int fd, int backlog) STUB_ONLY;
++
++int sys_inotify_create(int flags, int *fd) STUB_ONLY;
++
++int sys_fork(pid_t *child) STUB_ONLY;
++
++int sys_execve(const char *path, char *const argv[], char *const envp[]) STUB_ONLY;
++
++int sys_fcntl(int fd, int request, va_list args, int *result) STUB_ONLY;
++
++int sys_dup(int fd, int flags, int *newfd) STUB_ONLY;
++
++int sys_dup2(int fd, int flags, int newfd) STUB_ONLY;
++
++int
++sys_sigprocmask(int how, const sigset_t *__restrict set, sigset_t *__restrict retrieve) STUB_ONLY;
++
++int sys_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) { return 0; };
++
++int sys_signalfd_create(sigset_t mask, int flags, int *fd) STUB_ONLY;
++
++int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) STUB_ONLY;
++
++int sys_getgroups(size_t size, const gid_t *list, int *_ret) STUB_ONLY;
++
++int sys_mount(
++    const char *source,
++    const char *target,
++    const char *fstype,
++    unsigned long flags,
++    const void *data
++) STUB_ONLY;
++
++int sys_umount2(const char *target, int flags) STUB_ONLY;
++
++int sys_gethostname(char *buffer, size_t bufsize) STUB_ONLY;
++
++int sys_sethostname(const char *buffer, size_t bufsize) STUB_ONLY;
++
++int sys_sleep(time_t *secs, long *nanos) STUB_ONLY;
++
++int sys_getitimer(int, struct itimerval *) STUB_ONLY;
++
++int sys_setitimer(int, const struct itimerval *, struct itimerval *) STUB_ONLY;
++
++#endif
++
++} // namespace mlibc
+diff --git a/sysdeps/template/include/abi-bits/access.h b/sysdeps/template/include/abi-bits/access.h
+new file mode 120000
+index 000000000..cb8393167
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/access.h
+@@ -0,0 +1 @@
++../../../../abis/linux/access.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/auxv.h b/sysdeps/template/include/abi-bits/auxv.h
+new file mode 120000
+index 000000000..c43f87864
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/auxv.h
+@@ -0,0 +1 @@
++../../../../abis/linux/auxv.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/blkcnt_t.h b/sysdeps/template/include/abi-bits/blkcnt_t.h
+new file mode 120000
+index 000000000..0b0ec270d
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/blkcnt_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/blkcnt_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/blksize_t.h b/sysdeps/template/include/abi-bits/blksize_t.h
+new file mode 120000
+index 000000000..7dc8d7cfa
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/blksize_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/blksize_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/clockid_t.h b/sysdeps/template/include/abi-bits/clockid_t.h
+new file mode 120000
+index 000000000..6a42da56a
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/clockid_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/clockid_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/dev_t.h b/sysdeps/template/include/abi-bits/dev_t.h
+new file mode 120000
+index 000000000..bca881e92
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/dev_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/dev_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/epoll.h b/sysdeps/template/include/abi-bits/epoll.h
+new file mode 120000
+index 000000000..eb4b76dcf
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/epoll.h
+@@ -0,0 +1 @@
++../../../../abis/linux/epoll.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/errno.h b/sysdeps/template/include/abi-bits/errno.h
+new file mode 120000
+index 000000000..6e507deff
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/errno.h
+@@ -0,0 +1 @@
++../../../../abis/linux/errno.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/fcntl.h b/sysdeps/template/include/abi-bits/fcntl.h
+new file mode 120000
+index 000000000..463e2c954
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/fcntl.h
+@@ -0,0 +1 @@
++../../../../abis/linux/fcntl.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/fd_set.h b/sysdeps/template/include/abi-bits/fd_set.h
+new file mode 120000
+index 000000000..b43142c4d
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/fd_set.h
+@@ -0,0 +1 @@
++../../../../abis/linux/fd_set.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/fsblkcnt_t.h b/sysdeps/template/include/abi-bits/fsblkcnt_t.h
+new file mode 120000
+index 000000000..898dfb2f3
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/fsblkcnt_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/fsblkcnt_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/fsfilcnt_t.h b/sysdeps/template/include/abi-bits/fsfilcnt_t.h
+new file mode 120000
+index 000000000..791755c9c
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/fsfilcnt_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/fsfilcnt_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/gid_t.h b/sysdeps/template/include/abi-bits/gid_t.h
+new file mode 120000
+index 000000000..abce6d69a
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/gid_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/gid_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/in.h b/sysdeps/template/include/abi-bits/in.h
+new file mode 120000
+index 000000000..418d1d5c0
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/in.h
+@@ -0,0 +1 @@
++../../../../abis/linux/in.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/ino_t.h b/sysdeps/template/include/abi-bits/ino_t.h
+new file mode 120000
+index 000000000..4c20aca26
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/ino_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/ino_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/inotify.h b/sysdeps/template/include/abi-bits/inotify.h
+new file mode 120000
+index 000000000..b5cb28237
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/inotify.h
+@@ -0,0 +1 @@
++../../../../abis/linux/inotify.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/ioctls.h b/sysdeps/template/include/abi-bits/ioctls.h
+new file mode 120000
+index 000000000..595106b6f
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/ioctls.h
+@@ -0,0 +1 @@
++../../../../abis/linux/ioctls.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/ipc.h b/sysdeps/template/include/abi-bits/ipc.h
+new file mode 120000
+index 000000000..2c7ffc4c9
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/ipc.h
+@@ -0,0 +1 @@
++../../../../abis/linux/ipc.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/limits.h b/sysdeps/template/include/abi-bits/limits.h
+new file mode 120000
+index 000000000..6c88db2ed
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/limits.h
+@@ -0,0 +1 @@
++../../../../abis/linux/limits.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/mode_t.h b/sysdeps/template/include/abi-bits/mode_t.h
+new file mode 120000
+index 000000000..5d78fdfc3
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/mode_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/mode_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/mqueue.h b/sysdeps/template/include/abi-bits/mqueue.h
+new file mode 120000
+index 000000000..fa87b078a
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/mqueue.h
+@@ -0,0 +1 @@
++../../../../abis/linux/mqueue.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/msg.h b/sysdeps/template/include/abi-bits/msg.h
+new file mode 120000
+index 000000000..f402b4930
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/msg.h
+@@ -0,0 +1 @@
++../../../../abis/linux/msg.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/nlink_t.h b/sysdeps/template/include/abi-bits/nlink_t.h
+new file mode 120000
+index 000000000..bb3b625c3
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/nlink_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/nlink_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/packet.h b/sysdeps/template/include/abi-bits/packet.h
+new file mode 120000
+index 000000000..998ef1ab0
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/packet.h
+@@ -0,0 +1 @@
++../../../../abis/linux/packet.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/pid_t.h b/sysdeps/template/include/abi-bits/pid_t.h
+new file mode 120000
+index 000000000..baa90f6af
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/pid_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/pid_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/poll.h b/sysdeps/template/include/abi-bits/poll.h
+new file mode 120000
+index 000000000..8ea6a0a39
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/poll.h
+@@ -0,0 +1 @@
++../../../../abis/linux/poll.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/ptrace.h b/sysdeps/template/include/abi-bits/ptrace.h
+new file mode 120000
+index 000000000..b2517b2cf
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/ptrace.h
+@@ -0,0 +1 @@
++../../../../abis/linux/ptrace.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/random.h b/sysdeps/template/include/abi-bits/random.h
+new file mode 120000
+index 000000000..83fc3d961
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/random.h
+@@ -0,0 +1 @@
++../../../../abis/linux/random.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/reboot.h b/sysdeps/template/include/abi-bits/reboot.h
+new file mode 120000
+index 000000000..77013a416
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/reboot.h
+@@ -0,0 +1 @@
++../../../../abis/linux/reboot.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/resource.h b/sysdeps/template/include/abi-bits/resource.h
+new file mode 120000
+index 000000000..88d74025f
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/resource.h
+@@ -0,0 +1 @@
++../../../../abis/linux/resource.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/riscv-hwprobe.h b/sysdeps/template/include/abi-bits/riscv-hwprobe.h
+new file mode 120000
+index 000000000..e65132501
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/riscv-hwprobe.h
+@@ -0,0 +1 @@
++../../../../abis/linux/riscv-hwprobe.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/rlim_t.h b/sysdeps/template/include/abi-bits/rlim_t.h
+new file mode 120000
+index 000000000..e92eb5fb8
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/rlim_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/rlim_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/route.h b/sysdeps/template/include/abi-bits/route.h
+new file mode 120000
+index 000000000..313ead67b
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/route.h
+@@ -0,0 +1 @@
++../../../../abis/linux/route.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/sa_family_t.h b/sysdeps/template/include/abi-bits/sa_family_t.h
+new file mode 120000
+index 000000000..a75e22967
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/sa_family_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/sa_family_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/seek-whence.h b/sysdeps/template/include/abi-bits/seek-whence.h
+new file mode 120000
+index 000000000..df7bccf02
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/seek-whence.h
+@@ -0,0 +1 @@
++../../../../abis/linux/seek-whence.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/sem.h b/sysdeps/template/include/abi-bits/sem.h
+new file mode 120000
+index 000000000..699d7afa5
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/sem.h
+@@ -0,0 +1 @@
++../../../../abis/linux/sem.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/shm.h b/sysdeps/template/include/abi-bits/shm.h
+new file mode 120000
+index 000000000..067d8c4fa
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/shm.h
+@@ -0,0 +1 @@
++../../../../abis/linux/shm.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/sig-limits.h b/sysdeps/template/include/abi-bits/sig-limits.h
+new file mode 120000
+index 000000000..f829738ed
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/sig-limits.h
+@@ -0,0 +1 @@
++../../../../abis/linux/sig-limits.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/sigevent.h b/sysdeps/template/include/abi-bits/sigevent.h
+new file mode 120000
+index 000000000..83d069b5b
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/sigevent.h
+@@ -0,0 +1 @@
++../../../../abis/linux/sigevent.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/signal.h b/sysdeps/template/include/abi-bits/signal.h
+new file mode 120000
+index 000000000..4dcb0b7ce
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/signal.h
+@@ -0,0 +1 @@
++../../../../abis/linux/signal.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/sigset_t.h b/sysdeps/template/include/abi-bits/sigset_t.h
+new file mode 120000
+index 000000000..8b8e81e8b
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/sigset_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/sigset_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/sigval.h b/sysdeps/template/include/abi-bits/sigval.h
+new file mode 120000
+index 000000000..ccd43a550
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/sigval.h
+@@ -0,0 +1 @@
++../../../../abis/linux/sigval.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/sockaddr_storage.h b/sysdeps/template/include/abi-bits/sockaddr_storage.h
+new file mode 120000
+index 000000000..b3748654f
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/sockaddr_storage.h
+@@ -0,0 +1 @@
++../../../../abis/linux/sockaddr_storage.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/socket.h b/sysdeps/template/include/abi-bits/socket.h
+new file mode 120000
+index 000000000..f1dc016e6
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/socket.h
+@@ -0,0 +1 @@
++../../../../abis/linux/socket.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/socklen_t.h b/sysdeps/template/include/abi-bits/socklen_t.h
+new file mode 120000
+index 000000000..41f3b11f3
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/socklen_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/socklen_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/stat.h b/sysdeps/template/include/abi-bits/stat.h
+new file mode 120000
+index 000000000..1f63b41fd
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/stat.h
+@@ -0,0 +1 @@
++../../../../abis/linux/stat.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/statfs.h b/sysdeps/template/include/abi-bits/statfs.h
+new file mode 120000
+index 000000000..e3d202f53
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/statfs.h
+@@ -0,0 +1 @@
++../../../../abis/linux/statfs.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/statvfs.h b/sysdeps/template/include/abi-bits/statvfs.h
+new file mode 120000
+index 000000000..1fc80c2a7
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/statvfs.h
+@@ -0,0 +1 @@
++../../../../abis/linux/statvfs.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/statx.h b/sysdeps/template/include/abi-bits/statx.h
+new file mode 120000
+index 000000000..8702a1d00
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/statx.h
+@@ -0,0 +1 @@
++../../../../abis/linux/statx.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/suseconds_t.h b/sysdeps/template/include/abi-bits/suseconds_t.h
+new file mode 120000
+index 000000000..9ed659770
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/suseconds_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/suseconds_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/termios.h b/sysdeps/template/include/abi-bits/termios.h
+new file mode 120000
+index 000000000..ee8f0b091
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/termios.h
+@@ -0,0 +1 @@
++../../../../abis/linux/termios.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/time.h b/sysdeps/template/include/abi-bits/time.h
+new file mode 120000
+index 000000000..2a0262574
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/time.h
+@@ -0,0 +1 @@
++../../../../abis/linux/time.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/uid_t.h b/sysdeps/template/include/abi-bits/uid_t.h
+new file mode 120000
+index 000000000..b30677785
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/uid_t.h
+@@ -0,0 +1 @@
++../../../../abis/linux/uid_t.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/utmp-defines.h b/sysdeps/template/include/abi-bits/utmp-defines.h
+new file mode 120000
+index 000000000..861764359
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/utmp-defines.h
+@@ -0,0 +1 @@
++../../../../abis/linux/utmp-defines.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/utmpx.h b/sysdeps/template/include/abi-bits/utmpx.h
+new file mode 120000
+index 000000000..c6a26774f
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/utmpx.h
+@@ -0,0 +1 @@
++../../../../abis/linux/utmpx.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/utsname.h b/sysdeps/template/include/abi-bits/utsname.h
+new file mode 120000
+index 000000000..b28575474
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/utsname.h
+@@ -0,0 +1 @@
++../../../../abis/linux/utsname.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/vm-flags.h b/sysdeps/template/include/abi-bits/vm-flags.h
+new file mode 120000
+index 000000000..bbe258cff
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/vm-flags.h
+@@ -0,0 +1 @@
++../../../../abis/linux/vm-flags.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/vt.h b/sysdeps/template/include/abi-bits/vt.h
+new file mode 120000
+index 000000000..5798a4ac9
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/vt.h
+@@ -0,0 +1 @@
++../../../../abis/linux/vt.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/wait.h b/sysdeps/template/include/abi-bits/wait.h
+new file mode 120000
+index 000000000..feb2840c5
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/wait.h
+@@ -0,0 +1 @@
++../../../../abis/linux/wait.h
+\ No newline at end of file
+diff --git a/sysdeps/template/include/abi-bits/xattr.h b/sysdeps/template/include/abi-bits/xattr.h
+new file mode 120000
+index 000000000..66412d706
+--- /dev/null
++++ b/sysdeps/template/include/abi-bits/xattr.h
+@@ -0,0 +1 @@
++../../../../abis/linux/xattr.h
+\ No newline at end of file
+diff --git a/sysdeps/template/meson.build b/sysdeps/template/meson.build
+new file mode 100644
+index 000000000..b397c33bf
+--- /dev/null
++++ b/sysdeps/template/meson.build
+@@ -0,0 +1,8 @@
++sysdep_supported_options = {
++	'posix': true,
++}
++
++libc_sources += files(
++	'generic/generic.cpp'
++)
++libc_include_dirs += include_directories('include')
