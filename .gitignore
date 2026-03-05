@@ -1,6 +1,7 @@
 # Build cache
+.gradle/
+.kotlin/
 build/
-CMakeLists.txt
 
 # IDE Config
 .idea/

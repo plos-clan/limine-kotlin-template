@@ -1,8 +1,8 @@
 import kotlin.experimental.ExperimentalNativeApi
 import kotlinx.cinterop.*
-import limine.executable_file_request
-import limine.framebuffer_request
-import limine.limine_framebuffer
+import bridge.executable_file_request
+import bridge.framebuffer_request
+import bridge.limine_framebuffer
 
 @ExperimentalNativeApi
 @ExperimentalForeignApi

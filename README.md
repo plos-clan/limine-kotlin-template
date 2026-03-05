@@ -4,7 +4,7 @@ This repository will demonstrate how to set up a basic x86-64 kernel in Kotlin u
 
 ## Notes
 
-Initialize the `mlibc` submodule and build it once:
+Initialize the `mlibc` submodule:
 
 ```bash
 git submodule update --init --recursive
@@ -14,20 +14,25 @@ Only UEFI is supported in this template.
 
 ## Build
 
-**The build system is simplified:**
+This project uses Gradle for kernel build, ISO packaging, and QEMU run.
 
 - Supports kernel build, ISO packaging, and QEMU run
-- Assets (Limine and OVMF) are not fetched from the internet
+- Cross-platform compatible (Linux/macOS/Windows)
 
-**Available targets:**
-- `make` / `make kernel`: Build `build/kernel.elf`
-- `make iso`: Build the UEFI ISO image
-- `make run`: Run the ISO image in QEMU
-- `make clean`: Remove build outputs except `build/mlibc-*`
-- `make distclean`: Remove the entire `build` directory
-- `make mlibc`: Build bundled `mlibc` into `build/mlibc-x86_64/prefix`
+**Available Gradle tasks:**
+- `./gradlew build`: Build kernel ELF
+- `./gradlew buildIso`: Build the UEFI ISO image
+- `./gradlew run`: Run the ISO image in QEMU
+- `./gradlew clean`: Clean kernel build outputs
+- `./gradlew cleanAll`: Remove entire build directory
+- `./gradlew buildMlibc`: Build bundled mlibc
 
-You need to install Kotlin/Native (`konanc`, `cinterop`), Clang (`clang`, `clang++`), LLD (`ld.lld`), `xorriso`, and `make` to build the project, and QEMU (`qemu-system-x86_64`) to boot the ISO.
+You need to install:
+- JDK (Java Development Kit)
+- Clang (`clang`, `clang++`)
+- LLD (`ld.lld`)
+- `xorriso` (for ISO creation)
+- `qemu-system-x86_64` (for emulation)
 
 ## License
 
